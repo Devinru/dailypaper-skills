@@ -120,11 +120,60 @@ def parse_tier_table(content: str) -> list[dict]:
     return tiers
 
 
+def discover_paper_notes() -> list[dict]:
+    """Return paper notes below the notes root with stable, relative IDs."""
+    if not os.path.isdir(_NOTES_ROOT):
+        return []
+
+    notes = []
+    notes_root = os.path.realpath(_NOTES_ROOT)
+    concepts_root = os.path.realpath(CONCEPTS_DIR)
+    for root, dirs, files in os.walk(_NOTES_ROOT):
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".")
+            and os.path.realpath(os.path.join(root, d)) != concepts_root
+        )
+        parent_name = pathlib.Path(root).name
+        for filename in sorted(files):
+            if not filename.endswith(".md") or filename.startswith((".", "_")):
+                continue
+            stem = pathlib.Path(filename).stem
+            # generate-mocs creates one index note named after each directory.
+            if stem == parent_name:
+                continue
+            path = os.path.join(root, filename)
+            try:
+                if os.path.commonpath((notes_root, os.path.realpath(path))) != notes_root:
+                    continue
+            except ValueError:
+                continue
+            rel = pathlib.Path(os.path.relpath(path, _NOTES_ROOT))
+            notes.append({
+                "id": rel.with_suffix("").as_posix(),
+                "filename": stem,
+                "category": rel.parent.as_posix() if rel.parent != pathlib.Path(".") else "",
+                "path": path,
+            })
+    return notes
+
+
+def _find_paper_note(note_id: str) -> Optional[dict]:
+    notes = discover_paper_notes()
+    by_id = {note["id"]: note for note in notes}
+    if note_id in by_id:
+        return by_id[note_id]
+
+    # Keep old /notes/Filename links working when the basename is unambiguous.
+    if "/" not in note_id and "\\" not in note_id:
+        matches = [note for note in notes if note["filename"].casefold() == note_id.casefold()]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
 def _note_exists(name: str) -> bool:
-    for f in os.listdir(NOTES_DIR):
-        if f.endswith(".md") and pathlib.Path(f).stem.lower() == name.lower():
-            return True
-    return False
+    return _find_paper_note(name.removesuffix(".md")) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +186,18 @@ WIKILINK_INDEX: dict[str, dict] = {}
 def build_wikilink_index():
     global WIKILINK_INDEX
     idx: dict[str, dict] = {}
-    # Paper notes
-    if os.path.isdir(NOTES_DIR):
-        for f in os.listdir(NOTES_DIR):
-            if f.endswith(".md") and not f.startswith("_"):
-                stem = pathlib.Path(f).stem
-                idx[stem] = {"type": "note", "path": f"论文笔记/_待整理/{stem}"}
+    # Paper notes. Always index the relative path; only index a bare filename
+    # when it identifies exactly one note.
+    paper_notes = discover_paper_notes()
+    stem_counts: dict[str, int] = {}
+    for note in paper_notes:
+        key = note["filename"].casefold()
+        stem_counts[key] = stem_counts.get(key, 0) + 1
+    for note in paper_notes:
+        entry = {"type": "note", "path": note["id"]}
+        idx[note["id"]] = entry
+        if stem_counts[note["filename"].casefold()] == 1:
+            idx[note["filename"]] = entry
     # Concepts
     if os.path.isdir(CONCEPTS_DIR):
         for root, _dirs, files in os.walk(CONCEPTS_DIR):
@@ -248,18 +303,16 @@ def get_github_trending(filename: str):
 
 @app.get("/api/paper-notes")
 def list_paper_notes():
-    if not os.path.isdir(NOTES_DIR):
-        return []
     items = []
-    for f in sorted(os.listdir(NOTES_DIR)):
-        if not f.endswith(".md") or f.startswith("_"):
-            continue
-        fpath = os.path.join(NOTES_DIR, f)
-        content = open(fpath, encoding="utf-8").read(2000)
+    for note in discover_paper_notes():
+        with open(note["path"], encoding="utf-8") as f:
+            content = f.read(2000)
         meta, _ = parse_frontmatter(content)
         items.append({
-            "filename": pathlib.Path(f).stem,
-            "title": meta.get("title", pathlib.Path(f).stem),
+            "id": note["id"],
+            "filename": note["filename"],
+            "category": note["category"],
+            "title": meta.get("title", note["filename"]),
             "method_name": meta.get("method_name", ""),
             "venue": meta.get("venue", ""),
             "year": meta.get("year", ""),
@@ -269,12 +322,13 @@ def list_paper_notes():
     return items
 
 
-@app.get("/api/paper-notes/{filename}")
-def get_paper_note(filename: str):
-    fpath = os.path.join(NOTES_DIR, filename + ".md")
-    if not os.path.isfile(fpath):
+@app.get("/api/paper-notes/{note_id:path}")
+def get_paper_note(note_id: str):
+    note = _find_paper_note(note_id)
+    if note is None:
         return {"error": "not found"}
-    content = open(fpath, encoding="utf-8").read()
+    with open(note["path"], encoding="utf-8") as f:
+        content = f.read()
     meta, body = parse_frontmatter(content)
     return {"frontmatter": meta, "content": body}
 
@@ -335,7 +389,8 @@ def search(q: str = Query("", min_length=1)):
                     results.append({"type": rtype, "filename": stem, "title": stem, "snippet": ""})
                     continue
                 try:
-                    text = open(fpath, encoding="utf-8").read()
+                    with open(fpath, encoding="utf-8") as note_file:
+                        text = note_file.read()
                 except Exception:
                     continue
                 pos = text.lower().find(ql)
@@ -353,8 +408,35 @@ def search(q: str = Query("", min_length=1)):
                 if len(results) >= 50:
                     return
 
+    def scan_paper_notes():
+        for note in discover_paper_notes():
+            stem = note["filename"]
+            try:
+                with open(note["path"], encoding="utf-8") as note_file:
+                    text = note_file.read()
+            except Exception:
+                continue
+            pos = text.lower().find(ql)
+            if ql not in stem.lower() and pos < 0:
+                continue
+            meta, _ = parse_frontmatter(text)
+            snippet = ""
+            if pos >= 0:
+                start = max(0, pos - 50)
+                end = min(len(text), pos + len(q) + 80)
+                snippet = text[start:end].replace("\n", " ")
+            results.append({
+                "type": "note",
+                "id": note["id"],
+                "filename": stem,
+                "title": meta.get("title", stem),
+                "snippet": snippet,
+            })
+            if len(results) >= 50:
+                return
+
     scan_dir(DAILY_DIR, "daily")
-    scan_dir(NOTES_DIR, "note")
+    scan_paper_notes()
     scan_dir(CONCEPTS_DIR, "concept")
     return results[:50]
 

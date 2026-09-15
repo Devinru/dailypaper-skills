@@ -117,11 +117,11 @@ function initMarked() {
 
 function resolveWikilink(target) {
   const stem = target.includes('/') ? target.split('/').pop() : target;
-  const entry = WIKILINK_INDEX[stem];
+  const entry = WIKILINK_INDEX[target] || WIKILINK_INDEX[stem];
   if (!entry) return null;
   switch (entry.type) {
     case 'note':
-      return { href: '#/notes/' + stem, cls: 'wikilink-note' };
+      return { href: '#/notes/' + encodeURIComponent(entry.path), cls: 'wikilink-note' };
     case 'concept': {
       const parts = entry.path.split('/');
       return { href: '#/concepts/' + parts[2] + '/' + parts[3], cls: 'wikilink-concept' };
@@ -283,7 +283,7 @@ async function pageNotesList() {
     <h1 class="page-title">📝 Paper Notes</h1>
     <div class="notes-grid">
       ${notes.map(n => `
-        <a href="#/notes/${n.filename}" class="note-card">
+        <a href="#/notes/${encodeURIComponent(n.id)}" class="note-card">
           <div class="note-method">${n.method_name || n.filename}</div>
           <div class="note-title">${n.title || ''}</div>
           <div class="note-meta">${renderBadges(n)}</div>
@@ -351,7 +351,8 @@ async function pageSearch(params) {
           const resolved = WIKILINK_INDEX[r.filename];
           href = resolved ? '#/concepts/' + resolved.path.split('/')[2] + '/' + resolved.path.split('/')[3] : '#/';
         } else {
-          href = (typeLinks[r.type] || '#/') + r.filename;
+          const target = r.type === 'note' ? r.id : r.filename;
+          href = (typeLinks[r.type] || '#/') + encodeURIComponent(target);
         }
         return `<a href="${href}" class="search-item">
           <span class="search-item-type">${r.type}</span>
